@@ -1,0 +1,270 @@
+# MADA - Medical AI Diagnosis Assistant
+# Docker Compose configuration for complete system deployment
+
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:13-alpine
+    container_name: mada_postgres
+    environment:
+      POSTGRES_DB: mada_db
+      POSTGRES_USER: mada_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secure_password_change_me}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mada_user -d mada_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mada_network
+    restart: unless-stopped
+
+  # Redis for caching and session management
+  redis:
+    image: redis:7-alpine
+    container_name: mada_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mada_network
+    restart: unless-stopped
+
+  # MADA Web Dashboard
+  mada_dashboard:
+    build:
+      context: .
+      target: production
+      dockerfile: Dockerfile
+    container_name: mada_dashboard
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=mada_db
+      - DB_USER=mada_user
+      - DB_PASSWORD=${DB_PASSWORD:-secure_password_change_me}
+      - REDIS_URL=redis://redis:6379
+      - ENVIRONMENT=production
+      - SECRET_KEY=${SECRET_KEY:-change_this_secret_key}
+    ports:
+      - "8501:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    networks:
+      - mada_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # MADA API Server (FastAPI)
+  mada_api:
+    build:
+      context: .
+      target: production
+      dockerfile: Dockerfile
+    container_name: mada_api
+    command: ["python", "-m", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=mada_db
+      - DB_USER=mada_user
+      - DB_PASSWORD=${DB_PASSWORD:-secure_password_change_me}
+      - REDIS_URL=redis://redis:6379
+      - ENVIRONMENT=production
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    networks:
+      - mada_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ML Model Training Service
+  mada_trainer:
+    build:
+      context: .
+      target: production
+      dockerfile: Dockerfile
+    container_name: mada_trainer
+    command: ["python", "src/training/model_trainer.py"]
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=mada_db
+      - DB_USER=mada_user
+      - DB_PASSWORD=${DB_PASSWORD:-secure_password_change_me}
+      - REDIS_URL=redis://redis:6379
+      - ENVIRONMENT=production
+      - TRAINING_SCHEDULE=${TRAINING_SCHEDULE:-0 2 * * *}  # Daily at 2 AM
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    networks:
+      - mada_network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+          cpus: '2.0'
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: mada_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - mada_dashboard
+      - mada_api
+    networks:
+      - mada_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Monitoring with Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: mada_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - mada_network
+    restart: unless-stopped
+
+  # Grafana for Dashboard Monitoring
+  grafana:
+    image: grafana/grafana:latest
+    container_name: mada_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+    depends_on:
+      - prometheus
+    networks:
+      - mada_network
+    restart: unless-stopped
+
+  # Log Management with ELK Stack
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.14.0
+    container_name: mada_elasticsearch
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - xpack.security.enabled=false
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - mada_network
+    restart: unless-stopped
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:7.14.0
+    container_name: mada_logstash
+    volumes:
+      - ./monitoring/logstash/logstash.conf:/usr/share/logstash/pipeline/logstash.conf
+      - ./logs:/app/logs:ro
+    depends_on:
+      - elasticsearch
+    networks:
+      - mada_network
+    restart: unless-stopped
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:7.14.0
+    container_name: mada_kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - mada_network
+    restart: unless-stopped
+
+# Named volumes for data persistence
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
+
+# Network configuration
+networks:
+  mada_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
