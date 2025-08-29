@@ -1,48 +1,81 @@
-"""
-Data Preprocessing Pipeline
-Coordinates all preprocessing steps for patient data
-"""
 
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Any, Optional, Tuple, Union
 import logging
-from datetime import datetime
-import joblib
-import os
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
 
-from .feature_engineer import MedicalFeatureEngineer
-from src.patient_intake.models import PatientIntakeForm, ProcessedPatientData
-from config.config import MODELS_DIR
-
+# Configure logging
 logger = logging.getLogger(__name__)
 
-
 class MedicalDataPreprocessor:
-    """
-    Main preprocessing pipeline for medical patient data
-    Combines feature engineering, normalization, and data validation
-    """
-    
-    def __init__(self, load_preprocessors: bool = False):
-        self.feature_engineer = MedicalFeatureEngineer()
-        self.is_fitted = False
-        self.feature_names = None
-        self.target_names = None
+    def __init__(self, numerical_features, categorical_features, test_size=0.2, random_state=42):
+        self.numerical_features = numerical_features
+        self.categorical_features = categorical_features
+        self.test_size = test_size
+        self.random_state = random_state
+        self.preprocessor = self._build_preprocessor()
+
+    def _build_preprocessor(self):
+        # Create preprocessing pipelines for both numerical and categorical data
+        numerical_transformer = Pipeline(steps=[
+            ('imputer', SimpleImputer(strategy='median')),
+            ('scaler', StandardScaler())
+        ])
+
+        categorical_transformer = Pipeline(steps=[
+            ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+            ('onehot', OneHotEncoder(handle_unknown='ignore'))
+        ])
+
+        # Bundle preprocessing for numerical and categorical features
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ('num', numerical_transformer, self.numerical_features),
+                ('cat', categorical_transformer, self.categorical_features)
+            ])
         
-        # Load pre-trained preprocessors if available
-        if load_preprocessors:
-            self.load_preprocessors()
-    
-    def fit(self, patient_data_list: List[Dict[str, Any]], 
-            target_data: Optional[List[str]] = None) -> 'MedicalDataPreprocessor':
-        """
-        Fit the preprocessing pipeline on training data
-        """
-        logger.info(f\"Fitting preprocessor on {len(patient_data_list)} patients\")
+        return preprocessor
+
+    def preprocess(self, data):
+        # Separate features and target variable
+        X = data.drop('target', axis=1)
+        y = data['target']
+
+        # Split data into training and testing sets
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=self.test_size, random_state=self.random_state)
+
+        # Apply preprocessing
+        X_train_processed = self.preprocessor.fit_transform(X_train)
+        X_test_processed = self.preprocessor.transform(X_test)
         
-        # Convert patient data to features
-        features_list = []
-        for patient_data in patient_data_list:
-            features = self.feature_engineer.process_patient_data(patient_data)
-            features_list.append(features)\n        \n        # Create DataFrame from features\n        features_df = pd.DataFrame(features_list)\n        \n        # Handle missing values and fit imputers\n        features_df = self.feature_engineer.handle_missing_values(features_df)\n        \n        # Normalize features and fit scalers\n        features_df = self.feature_engineer.normalize_features(features_df, fit=True)\n        \n        # Feature selection if target data is provided\n        if target_data is not None:\n            target_series = pd.Series(target_data)\n            features_df = self.feature_engineer.select_features(features_df, target_series)\n        \n        # Store feature names for consistency\n        self.feature_names = features_df.columns.tolist()\n        self.is_fitted = True\n        \n        logger.info(f\"Preprocessor fitted with {len(self.feature_names)} features\")\n        return self\n    \n    def transform(self, patient_data_list: List[Dict[str, Any]]) -> pd.DataFrame:\n        \"\"\"\n        Transform patient data using fitted preprocessors\n        \"\"\"\n        if not self.is_fitted:\n            raise ValueError(\"Preprocessor must be fitted before transform\")\n        \n        logger.info(f\"Transforming {len(patient_data_list)} patients\")\n        \n        # Convert patient data to features\n        features_list = []\n        for patient_data in patient_data_list:\n            features = self.feature_engineer.process_patient_data(patient_data)\n            features_list.append(features)\n        \n        # Create DataFrame\n        features_df = pd.DataFrame(features_list)\n        \n        # Ensure all required features are present\n        features_df = self._align_features(features_df)\n        \n        # Apply preprocessing steps\n        features_df = self.feature_engineer.handle_missing_values(features_df)\n        features_df = self.feature_engineer.normalize_features(features_df, fit=False)\n        \n        logger.info(f\"Transformation completed. Output shape: {features_df.shape}\")\n        return features_df\n    \n    def fit_transform(self, patient_data_list: List[Dict[str, Any]], \n                     target_data: Optional[List[str]] = None) -> pd.DataFrame:\n        \"\"\"\n        Fit and transform in one step\n        \"\"\"\n        return self.fit(patient_data_list, target_data).transform(patient_data_list)\n    \n    def _align_features(self, features_df: pd.DataFrame) -> pd.DataFrame:\n        \"\"\"\n        Ensure feature DataFrame has the same columns as training data\n        \"\"\"\n        if self.feature_names is None:\n            return features_df\n        \n        # Add missing columns with zeros\n        for feature in self.feature_names:\n            if feature not in features_df.columns:\n                features_df[feature] = 0\n        \n        # Remove extra columns and reorder\n        features_df = features_df[self.feature_names]\n        \n        return features_df\n    \n    def process_single_patient(self, patient_data: Dict[str, Any]) -> pd.DataFrame:\n        \"\"\"\n        Process a single patient's data\n        \"\"\"\n        return self.transform([patient_data])\n    \n    def create_training_dataset(self, patient_data_list: List[Dict[str, Any]], \n                              diagnoses_list: List[List[str]],\n                              balance_classes: bool = True) -> Tuple[pd.DataFrame, pd.Series]:\n        \"\"\"\n        Create a balanced training dataset for ML models\n        \"\"\"\n        logger.info(\"Creating training dataset\")\n        \n        # Process features\n        X = self.fit_transform(patient_data_list)\n        \n        # Process target labels (for now, use primary diagnosis)\n        y_labels = []\n        for diagnoses in diagnoses_list:\n            if diagnoses:\n                primary_diagnosis = diagnoses[0]  # Use first diagnosis as primary\n                y_labels.append(primary_diagnosis)\n            else:\n                y_labels.append('no_diagnosis')\n        \n        y = pd.Series(y_labels)\n        \n        # Balance classes if requested\n        if balance_classes:\n            X, y = self._balance_dataset(X, y)\n        \n        logger.info(f\"Training dataset created: X shape {X.shape}, y shape {y.shape}\")\n        return X, y\n    \n    def _balance_dataset(self, X: pd.DataFrame, y: pd.Series) -> Tuple[pd.DataFrame, pd.Series]:\n        \"\"\"\n        Balance dataset classes using undersampling/oversampling\n        \"\"\"\n        try:\n            from imblearn.over_sampling import SMOTE\n            from imblearn.under_sampling import RandomUnderSampler\n            from imblearn.pipeline import Pipeline as ImbPipeline\n            \n            # Use SMOTE for oversampling minority classes\n            smote = SMOTE(random_state=42)\n            \n            # Apply SMOTE\n            X_resampled, y_resampled = smote.fit_resample(X, y)\n            \n            logger.info(f\"Dataset balanced using SMOTE. New shape: {X_resampled.shape}\")\n            return pd.DataFrame(X_resampled, columns=X.columns), pd.Series(y_resampled)\n            \n        except ImportError:\n            logger.warning(\"imbalanced-learn not available. Skipping class balancing.\")\n            return X, y\n        except Exception as e:\n            logger.warning(f\"Class balancing failed: {e}. Returning original dataset.\")\n            return X, y\n    \n    def get_feature_importance_data(self, X: pd.DataFrame, y: pd.Series) -> Dict[str, float]:\n        \"\"\"\n        Calculate feature importance using various methods\n        \"\"\"\n        from sklearn.ensemble import RandomForestClassifier\n        from sklearn.feature_selection import mutual_info_classif\n        \n        importance_data = {}\n        \n        try:\n            # Random Forest feature importance\n            rf = RandomForestClassifier(n_estimators=100, random_state=42)\n            rf.fit(X, y)\n            \n            rf_importance = dict(zip(X.columns, rf.feature_importances_))\n            \n            # Mutual information\n            mi_scores = mutual_info_classif(X, y, random_state=42)\n            mi_importance = dict(zip(X.columns, mi_scores))\n            \n            # Combine importance scores\n            for feature in X.columns:\n                importance_data[feature] = {\n                    'random_forest': rf_importance.get(feature, 0),\n                    'mutual_info': mi_importance.get(feature, 0)\n                }\n        \n        except Exception as e:\n            logger.error(f\"Feature importance calculation failed: {e}\")\n        \n        return importance_data\n    \n    def validate_data_quality(self, patient_data_list: List[Dict[str, Any]]) -> Dict[str, Any]:\n        \"\"\"\n        Validate data quality and provide quality metrics\n        \"\"\"\n        logger.info(\"Validating data quality\")\n        \n        quality_report = {\n            'total_patients': len(patient_data_list),\n            'data_completeness': {},\n            'data_ranges': {},\n            'anomalies': [],\n            'recommendations': []\n        }\n        \n        # Check data completeness\n        field_counts = {\n            'demographics': 0,\n            'vital_signs': 0,\n            'medical_history': 0,\n            'chief_complaint': 0,\n            'lab_results': 0\n        }\n        \n        vital_signs_data = []\n        ages = []\n        \n        for patient_data in patient_data_list:\n            for field in field_counts.keys():\n                if field in patient_data and patient_data[field] is not None:\n                    field_counts[field] += 1\n            \n            # Collect data for range validation\n            if 'demographics' in patient_data and 'age' in patient_data['demographics']:\n                ages.append(patient_data['demographics']['age'])\n            \n            if 'vital_signs' in patient_data:\n                vital_signs_data.append(patient_data['vital_signs'])\n        \n        # Calculate completeness percentages\n        total_patients = len(patient_data_list)\n        for field, count in field_counts.items():\n            quality_report['data_completeness'][field] = {\n                'count': count,\n                'percentage': (count / total_patients * 100) if total_patients > 0 else 0\n            }\n        \n        # Validate ranges\n        if ages:\n            quality_report['data_ranges']['age'] = {\n                'min': min(ages),\n                'max': max(ages),\n                'mean': np.mean(ages),\n                'std': np.std(ages)\n            }\n            \n            # Check for age anomalies\n            if any(age < 0 or age > 150 for age in ages):\n                quality_report['anomalies'].append('Invalid age values detected')\n        \n        # Validate vital signs ranges\n        if vital_signs_data:\n            vital_stats = self._analyze_vital_signs(vital_signs_data)\n            quality_report['data_ranges']['vital_signs'] = vital_stats\n        \n        # Generate recommendations\n        quality_report['recommendations'] = self._generate_quality_recommendations(quality_report)\n        \n        logger.info(\"Data quality validation completed\")\n        return quality_report\n    \n    def _analyze_vital_signs(self, vital_signs_data: List[Dict[str, Any]]) -> Dict[str, Any]:\n        \"\"\"\n        Analyze vital signs data for quality assessment\n        \"\"\"\n        vital_stats = {}\n        \n        vital_fields = ['systolic_bp', 'diastolic_bp', 'heart_rate', 'temperature']\n        \n        for field in vital_fields:\n            values = []\n            for vitals in vital_signs_data:\n                if vitals and field in vitals and vitals[field] is not None:\n                    values.append(vitals[field])\n            \n            if values:\n                vital_stats[field] = {\n                    'count': len(values),\n                    'min': min(values),\n                    'max': max(values),\n                    'mean': np.mean(values),\n                    'std': np.std(values),\n                    'completeness': len(values) / len(vital_signs_data) * 100\n                }\n        \n        return vital_stats\n    \n    def _generate_quality_recommendations(self, quality_report: Dict[str, Any]) -> List[str]:\n        \"\"\"\n        Generate recommendations based on data quality analysis\n        \"\"\"\n        recommendations = []\n        \n        # Check completeness\n        for field, data in quality_report['data_completeness'].items():\n            if data['percentage'] < 50:\n                recommendations.append(f\"Low {field} data completeness ({data['percentage']:.1f}%). Consider improving data collection.\")\n        \n        # Check for anomalies\n        if quality_report['anomalies']:\n            recommendations.append(\"Data anomalies detected. Review and clean data before training models.\")\n        \n        # Check vital signs completeness\n        if 'vital_signs' in quality_report['data_ranges']:\n            for vital, stats in quality_report['data_ranges']['vital_signs'].items():\n                if stats['completeness'] < 30:\n                    recommendations.append(f\"Low {vital} data completeness ({stats['completeness']:.1f}%). Important for medical predictions.\")\n        \n        return recommendations\n    \n    def save_preprocessors(self, filepath: str = None) -> bool:\n        \"\"\"\n        Save fitted preprocessors to disk\n        \"\"\"\n        if not self.is_fitted:\n            logger.warning(\"Cannot save unfitted preprocessors\")\n            return False\n        \n        if filepath is None:\n            filepath = os.path.join(MODELS_DIR, 'preprocessors.pkl')\n        \n        try:\n            # Create directory if it doesn't exist\n            os.makedirs(os.path.dirname(filepath), exist_ok=True)\n            \n            preprocessor_data = {\n                'feature_engineer': self.feature_engineer,\n                'feature_names': self.feature_names,\n                'is_fitted': self.is_fitted,\n                'created_at': datetime.now().isoformat()\n            }\n            \n            joblib.dump(preprocessor_data, filepath)\n            logger.info(f\"Preprocessors saved to {filepath}\")\n            return True\n            \n        except Exception as e:\n            logger.error(f\"Failed to save preprocessors: {e}\")\n            return False\n    \n    def load_preprocessors(self, filepath: str = None) -> bool:\n        \"\"\"\n        Load fitted preprocessors from disk\n        \"\"\"\n        if filepath is None:\n            filepath = os.path.join(MODELS_DIR, 'preprocessors.pkl')\n        \n        try:\n            if not os.path.exists(filepath):\n                logger.warning(f\"Preprocessors file not found: {filepath}\")\n                return False\n            \n            preprocessor_data = joblib.load(filepath)\n            \n            self.feature_engineer = preprocessor_data['feature_engineer']\n            self.feature_names = preprocessor_data['feature_names']\n            self.is_fitted = preprocessor_data['is_fitted']\n            \n            logger.info(f\"Preprocessors loaded from {filepath}\")\n            return True\n            \n        except Exception as e:\n            logger.error(f\"Failed to load preprocessors: {e}\")\n            return False\n    \n    def get_preprocessing_summary(self) -> Dict[str, Any]:\n        \"\"\"\n        Get summary of preprocessing configuration\n        \"\"\"\n        return {\n            'is_fitted': self.is_fitted,\n            'num_features': len(self.feature_names) if self.feature_names else 0,\n            'feature_names': self.feature_names[:20] if self.feature_names else [],  # First 20 features\n            'preprocessing_steps': [\n                'Feature Engineering',\n                'Missing Value Imputation',\n                'Feature Normalization',\n                'Feature Selection (optional)'\n            ],\n            'medical_feature_categories': [\n                'Demographics',\n                'Vital Signs',\n                'Medical History',\n                'Symptoms',\n                'Lab Results',\n                'Derived Risk Scores'\n            ]\n        }
+        logger.info(f"Data preprocessed successfully. Shape of X_train: {X_train_processed.shape}")
+
+        return X_train_processed, X_test_processed, y_train, y_test, self.preprocessor
+
+# Example usage:
+if __name__ == '__main__':
+    # Sample DataFrame
+    data = {
+        'age': [25, 30, 35, 40, 45, 50, 55, 60],
+        'gender': ['M', 'F', 'M', 'F', 'M', 'F', 'M', 'M'],
+        'symptom1': [1, 0, 1, 0, 1, 0, 1, 1],
+        'symptom2': [0, 1, 0, 1, 0, 1, 0, 1],
+        'target': [0, 1, 0, 1, 0, 1, 0, 1]
+    }
+    df = pd.DataFrame(data)
+
+    numerical_features = ['age', 'symptom1', 'symptom2']
+    categorical_features = ['gender']
+
+    preprocessor = MedicalDataPreprocessor(numerical_features, categorical_features)
+    try:
+        X_train_p, X_test_p, y_train, y_test, proc = preprocessor.preprocess(df)
+        logger.info("Preprocessing complete.")
+        logger.info(f"X_train_processed shape: {X_train_p.shape}")
+        logger.info(f"X_test_processed shape: {X_test_p.shape}")
+    except Exception as e:
+        logger.error(f"Failed to preprocess data: {e}")
+

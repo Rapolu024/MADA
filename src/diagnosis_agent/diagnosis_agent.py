@@ -233,4 +233,416 @@ class MedicalReasoningEngine:
         
         # Medication allergies
         if 'penicillin' in [a.lower() for a in allergies]:
-            contraindications.append('penicillin_allergy')\n        \n        # Drug interactions (simplified)\n        med_names = [m.get('name', '').lower() for m in medications]\n        if 'warfarin' in med_names and 'aspirin' in med_names:\n            contraindications.append('bleeding_risk')\n        \n        return contraindications\n    \n    def _enhance_predictions(self, ml_predictions: Dict[str, float], \n                           rule_scores: Dict[str, float]) -> Dict[str, float]:\n        \"\"\"Enhance ML predictions with rule-based scores\"\"\"\n        enhanced = ml_predictions.copy()\n        \n        # Combine ML and rule-based scores\n        for condition, rule_score in rule_scores.items():\n            if condition in enhanced:\n                # Weighted combination (70% ML, 30% rules)\n                enhanced[condition] = 0.7 * enhanced[condition] + 0.3 * rule_score\n            else:\n                enhanced[condition] = rule_score\n        \n        return enhanced\n\n\nclass DiagnosisAgent:\n    \"\"\"\n    Main AI Diagnosis Agent\n    Orchestrates the entire diagnosis process using multiple models and clinical reasoning\n    \"\"\"\n    \n    def __init__(self, load_models: bool = True):\n        # Initialize components\n        self.preprocessor = MedicalDataPreprocessor(load_preprocessors=load_models)\n        self.model_ensemble = DiagnosisModelEnsemble()\n        self.nlp_processor = MedicalNLPProcessor()\n        self.reasoning_engine = MedicalReasoningEngine()\n        \n        # Load pre-trained models if available\n        if load_models:\n            self.load_models()\n        \n        # Diagnosis history for learning\n        self.diagnosis_history = []\n        \n        logger.info(\"Diagnosis Agent initialized\")\n    \n    def train(self, patient_data_list: List[Dict[str, Any]], \n              diagnoses_list: List[List[str]], save_models: bool = True) -> Dict[str, Any]:\n        \"\"\"\n        Train the diagnosis agent on labeled patient data\n        \"\"\"\n        logger.info(f\"Training diagnosis agent on {len(patient_data_list)} patients\")\n        \n        # Validate data quality\n        quality_report = self.preprocessor.validate_data_quality(patient_data_list)\n        logger.info(f\"Data quality report: {quality_report['recommendations']}\")\n        \n        # Create training dataset\n        X, y = self.preprocessor.create_training_dataset(patient_data_list, diagnoses_list)\n        \n        # Train the model ensemble\n        self.model_ensemble.fit(X, y)\n        \n        # Save models if requested\n        if save_models:\n            self.save_models()\n        \n        # Return training summary\n        training_summary = {\n            'num_patients': len(patient_data_list),\n            'num_features': X.shape[1],\n            'num_classes': len(y.unique()),\n            'data_quality': quality_report,\n            'model_performance': self.model_ensemble.performance_tracker.get_performance_summary(),\n            'best_model': self.model_ensemble.performance_tracker.get_best_model()\n        }\n        \n        logger.info(\"Training completed successfully\")\n        return training_summary\n    \n    def diagnose(self, patient_data: Dict[str, Any], \n                include_reasoning: bool = True) -> DiagnosisPrediction:\n        \"\"\"\n        Generate AI diagnosis for a patient\n        \"\"\"\n        logger.info(f\"Generating diagnosis for patient: {patient_data.get('patient_id', 'unknown')}\")\n        \n        patient_id = patient_data.get('patient_id', f'patient_{int(datetime.now().timestamp())}')\n        \n        try:\n            # Preprocess patient data\n            processed_features = self.preprocessor.process_single_patient(patient_data)\n            \n            # Get ML predictions\n            predictions = self.model_ensemble.predict(processed_features)\n            probabilities = self.model_ensemble.predict_proba(processed_features)\n            \n            # Convert to probability dictionary\n            class_names = self.model_ensemble.class_names\n            prob_dict = {}\n            if len(probabilities.shape) > 1 and probabilities.shape[1] > 1:\n                for i, class_name in enumerate(class_names):\n                    prob_dict[class_name] = float(probabilities[0][i])\n            else:\n                # Binary classification\n                prob_dict[class_names[1]] = float(probabilities[0])\n                prob_dict[class_names[0]] = 1.0 - float(probabilities[0])\n            \n            # Apply clinical reasoning if requested\n            if include_reasoning:\n                reasoning_results = self.reasoning_engine.apply_clinical_reasoning(\n                    patient_data, prob_dict\n                )\n                final_predictions = reasoning_results['enhanced_predictions']\n                clinical_flags = reasoning_results['clinical_flags']\n            else:\n                final_predictions = prob_dict\n                clinical_flags = []\n            \n            # Rank predictions by probability\n            sorted_predictions = sorted(\n                final_predictions.items(), \n                key=lambda x: x[1], \n                reverse=True\n            )[:5]  # Top 5 predictions\n            \n            # Structure predictions\n            structured_predictions = []\n            for condition, probability in sorted_predictions:\n                structured_predictions.append({\n                    'condition': condition,\n                    'probability': float(probability),\n                    'confidence_level': self._get_confidence_level(probability),\n                    'category': self._get_disease_category(condition)\n                })\n            \n            # Calculate overall confidence scores\n            confidence_scores = self._calculate_confidence_scores(final_predictions)\n            \n            # Perform risk assessment\n            risk_assessment = self._assess_risk(patient_data, final_predictions)\n            \n            # Generate recommendations\n            recommendations = self._generate_recommendations(\n                patient_data, structured_predictions, risk_assessment\n            )\n            \n            # Check for urgent flags\n            urgent_flags = self._check_urgent_flags(patient_data, structured_predictions)\n            \n            # Create diagnosis prediction\n            diagnosis = DiagnosisPrediction(\n                patient_id=patient_id,\n                predictions=structured_predictions,\n                confidence_scores=confidence_scores,\n                risk_assessment=risk_assessment,\n                recommendations=recommendations,\n                urgent_flags=urgent_flags\n            )\n            \n            # Store in history for learning\n            self.diagnosis_history.append(diagnosis)\n            \n            logger.info(f\"Diagnosis completed for patient {patient_id}\")\n            return diagnosis\n            \n        except Exception as e:\n            logger.error(f\"Diagnosis failed for patient {patient_id}: {e}\")\n            # Return empty diagnosis with error\n            return DiagnosisPrediction(\n                patient_id=patient_id,\n                predictions=[],\n                confidence_scores={'overall': 0.0},\n                risk_assessment={'overall_risk': 'unknown', 'risk_factors': []},\n                recommendations=[\"Unable to generate diagnosis. Please consult a healthcare professional.\"],\n                urgent_flags=[\"diagnosis_error\"]\n            )\n    \n    def _get_confidence_level(self, probability: float) -> str:\n        \"\"\"Convert probability to confidence level\"\"\"\n        if probability >= 0.8:\n            return 'high'\n        elif probability >= 0.6:\n            return 'medium'\n        elif probability >= 0.4:\n            return 'low'\n        else:\n            return 'very_low'\n    \n    def _get_disease_category(self, condition: str) -> str:\n        \"\"\"Get disease category for a condition\"\"\"\n        condition_lower = condition.lower()\n        for category, diseases in DISEASE_CATEGORIES.items():\n            if any(disease.lower() in condition_lower for disease in diseases):\n                return category\n        return 'other'\n    \n    def _calculate_confidence_scores(self, predictions: Dict[str, float]) -> Dict[str, float]:\n        \"\"\"Calculate various confidence metrics\"\"\"\n        if not predictions:\n            return {'overall': 0.0}\n        \n        probabilities = list(predictions.values())\n        top_prob = max(probabilities)\n        second_prob = sorted(probabilities, reverse=True)[1] if len(probabilities) > 1 else 0\n        \n        return {\n            'overall': float(top_prob),\n            'top_prediction': float(top_prob),\n            'certainty': float(top_prob - second_prob),  # Difference between top 2\n            'entropy': float(-sum(p * np.log(p + 1e-10) for p in probabilities if p > 0))\n        }\n    \n    def _assess_risk(self, patient_data: Dict[str, Any], \n                    predictions: Dict[str, float]) -> Dict[str, Any]:\n        \"\"\"Assess overall patient risk\"\"\"\n        risk_factors = []\n        risk_score = 0.0\n        \n        # Get top prediction probability\n        top_prob = max(predictions.values()) if predictions else 0\n        \n        # Age-based risk\n        demographics = patient_data.get('demographics', {})\n        age = demographics.get('age', 0)\n        if age >= 65:\n            risk_factors.append('elderly')\n            risk_score += 0.2\n        \n        # Vital signs risk\n        vital_signs = patient_data.get('vital_signs', {})\n        if vital_signs.get('systolic_bp', 0) > 160:\n            risk_factors.append('severe_hypertension')\n            risk_score += 0.3\n        \n        # High certainty predictions add to risk\n        if top_prob > 0.8:\n            risk_score += 0.2\n        \n        # Determine overall risk level\n        if risk_score >= RISK_THRESHOLDS['high']:\n            overall_risk = 'high'\n        elif risk_score >= RISK_THRESHOLDS['medium']:\n            overall_risk = 'medium'\n        else:\n            overall_risk = 'low'\n        \n        return {\n            'overall_risk': overall_risk,\n            'risk_score': float(risk_score),\n            'risk_factors': risk_factors,\n            'requires_immediate_attention': overall_risk == 'high'\n        }\n    \n    def _generate_recommendations(self, patient_data: Dict[str, Any],\n                                predictions: List[Dict[str, Any]],\n                                risk_assessment: Dict[str, Any]) -> List[str]:\n        \"\"\"Generate clinical recommendations based on diagnosis\"\"\"\n        recommendations = []\n        \n        if not predictions:\n            recommendations.append(\"Insufficient data for diagnosis. Please provide more information.\")\n            return recommendations\n        \n        top_prediction = predictions[0]\n        condition = top_prediction['condition']\n        probability = top_prediction['probability']\n        confidence = top_prediction['confidence_level']\n        \n        # High confidence recommendations\n        if confidence == 'high':\n            recommendations.append(f\"Strong indication of {condition}. Recommend immediate specialist consultation.\")\n        elif confidence == 'medium':\n            recommendations.append(f\"Moderate probability of {condition}. Consider further testing and specialist referral.\")\n        else:\n            recommendations.append(\"Inconclusive results. Recommend comprehensive examination and additional testing.\")\n        \n        # Risk-based recommendations\n        if risk_assessment['overall_risk'] == 'high':\n            recommendations.append(\"High-risk patient. Priority scheduling and close monitoring recommended.\")\n        \n        # Condition-specific recommendations\n        category = top_prediction['category']\n        if category == 'cardiovascular':\n            recommendations.append(\"Consider ECG, cardiac enzymes, and cardiology consultation.\")\n        elif category == 'respiratory':\n            recommendations.append(\"Consider chest X-ray, pulmonary function tests, and respiratory evaluation.\")\n        elif category == 'endocrine':\n            recommendations.append(\"Consider comprehensive metabolic panel and endocrinology consultation.\")\n        \n        # Lifestyle recommendations\n        medical_history = patient_data.get('medical_history', {})\n        if medical_history.get('smoking_status') == 'current':\n            recommendations.append(\"Strongly recommend smoking cessation counseling and support.\")\n        \n        return recommendations\n    \n    def _check_urgent_flags(self, patient_data: Dict[str, Any],\n                          predictions: List[Dict[str, Any]]) -> List[str]:\n        \"\"\"Check for conditions requiring urgent attention\"\"\"\n        urgent_flags = []\n        \n        # High probability of serious conditions\n        for prediction in predictions[:3]:  # Check top 3\n            if prediction['probability'] > 0.7:\n                condition = prediction['condition'].lower()\n                if any(urgent in condition for urgent in \n                      ['infarction', 'stroke', 'embolism', 'sepsis', 'failure']):\n                    urgent_flags.append(f\"possible_{prediction['condition']}\")\n        \n        # Vital signs urgency\n        vital_signs = patient_data.get('vital_signs', {})\n        if vital_signs.get('systolic_bp', 0) > 180:\n            urgent_flags.append('hypertensive_crisis')\n        if vital_signs.get('heart_rate', 0) > 130:\n            urgent_flags.append('severe_tachycardia')\n        if vital_signs.get('temperature', 0) > 103:\n            urgent_flags.append('high_fever')\n        \n        # Symptom-based urgency\n        chief_complaint = patient_data.get('chief_complaint', {})\n        if chief_complaint:\n            complaint_text = chief_complaint.get('primary_complaint', '').lower()\n            if any(urgent_symptom in complaint_text for urgent_symptom in \n                  ['chest pain', 'difficulty breathing', 'severe pain', 'bleeding']):\n                urgent_flags.append('urgent_symptoms')\n        \n        return urgent_flags\n    \n    def update_with_feedback(self, patient_id: str, correct_diagnosis: str, \n                           doctor_feedback: str = None):\n        \"\"\"Update models with doctor feedback (online learning)\"\"\"\n        logger.info(f\"Updating models with feedback for patient {patient_id}\")\n        \n        # Find the original diagnosis\n        original_diagnosis = None\n        for diagnosis in self.diagnosis_history:\n            if diagnosis.patient_id == patient_id:\n                original_diagnosis = diagnosis\n                break\n        \n        if not original_diagnosis:\n            logger.warning(f\"Original diagnosis not found for patient {patient_id}\")\n            return\n        \n        # Store feedback for analysis\n        feedback_record = {\n            'patient_id': patient_id,\n            'original_prediction': original_diagnosis.predictions[0]['condition'] if original_diagnosis.predictions else None,\n            'correct_diagnosis': correct_diagnosis,\n            'doctor_feedback': doctor_feedback,\n            'timestamp': datetime.now().isoformat()\n        }\n        \n        # This is where we would implement reinforcement learning\n        # For now, just log the feedback\n        logger.info(f\"Feedback recorded: {feedback_record}\")\n    \n    def save_models(self, filepath: str = None) -> bool:\n        \"\"\"Save all trained models and preprocessors\"\"\"\n        try:\n            # Save model ensemble\n            model_saved = self.model_ensemble.save_models(filepath)\n            \n            # Save preprocessor\n            preprocessor_saved = self.preprocessor.save_preprocessors()\n            \n            return model_saved and preprocessor_saved\n            \n        except Exception as e:\n            logger.error(f\"Failed to save models: {e}\")\n            return False\n    \n    def load_models(self, filepath: str = None) -> bool:\n        \"\"\"Load trained models and preprocessors\"\"\"\n        try:\n            # Load model ensemble\n            model_loaded = self.model_ensemble.load_models(filepath)\n            \n            # Load preprocessor\n            preprocessor_loaded = self.preprocessor.load_preprocessors()\n            \n            return model_loaded and preprocessor_loaded\n            \n        except Exception as e:\n            logger.error(f\"Failed to load models: {e}\")\n            return False\n    \n    def get_agent_summary(self) -> Dict[str, Any]:\n        \"\"\"Get comprehensive summary of the diagnosis agent\"\"\"\n        return {\n            'model_ensemble': self.model_ensemble.get_model_summary(),\n            'preprocessor': self.preprocessor.get_preprocessing_summary(),\n            'diagnosis_history_count': len(self.diagnosis_history),\n            'last_diagnosis': self.diagnosis_history[-1].to_dict() if self.diagnosis_history else None,\n            'agent_status': 'ready' if self.model_ensemble.is_fitted else 'untrained'\n        }
+            contraindications.append('penicillin_allergy')
+        
+        # Drug interactions (simplified)
+        med_names = [m.get('name', '').lower() for m in medications]
+        if 'warfarin' in med_names and 'aspirin' in med_names:
+            contraindications.append('bleeding_risk')
+        
+        return contraindications
+    
+    def _enhance_predictions(self, ml_predictions: Dict[str, float], 
+                           rule_scores: Dict[str, float]) -> Dict[str, float]:
+        """Enhance ML predictions with rule-based scores"""
+        enhanced = ml_predictions.copy()
+        
+        # Combine ML and rule-based scores
+        for condition, rule_score in rule_scores.items():
+            if condition in enhanced:
+                # Weighted combination (70% ML, 30% rules)
+                enhanced[condition] = 0.7 * enhanced[condition] + 0.3 * rule_score
+            else:
+                enhanced[condition] = rule_score
+        
+        return enhanced
+
+
+class DiagnosisAgent:
+    """
+    Main AI Diagnosis Agent
+    Orchestrates the entire diagnosis process using multiple models and clinical reasoning
+    """
+    
+    def __init__(self, load_models: bool = True):
+        # Initialize components
+        try:
+            self.preprocessor = MedicalDataPreprocessor(load_preprocessors=load_models)
+            self.model_ensemble = DiagnosisModelEnsemble()
+            self.nlp_processor = MedicalNLPProcessor()
+            self.reasoning_engine = MedicalReasoningEngine()
+        except Exception as e:
+            logger.warning(f"Could not initialize all components: {e}")
+            # Initialize with minimal components for demo
+            self.preprocessor = None
+            self.model_ensemble = None
+            self.nlp_processor = None
+            self.reasoning_engine = MedicalReasoningEngine()
+        
+        # Load pre-trained models if available
+        if load_models and self.model_ensemble:
+            try:
+                self.load_models()
+            except Exception as e:
+                logger.warning(f"Could not load models: {e}")
+        
+        # Diagnosis history for learning
+        self.diagnosis_history = []
+        
+        logger.info("Diagnosis Agent initialized")
+    
+    def diagnose(self, patient_data: Dict[str, Any], 
+                include_reasoning: bool = True) -> DiagnosisPrediction:
+        """
+        Generate AI diagnosis for a patient
+        """
+        logger.info(f"Generating diagnosis for patient: {patient_data.get('patient_id', 'unknown')}")
+        
+        patient_id = patient_data.get('patient_id', f'patient_{int(datetime.now().timestamp())}')
+        
+        try:
+            # For demo purposes, return mock predictions if models aren't available
+            if not self.model_ensemble or not self.preprocessor:
+                return self._generate_mock_diagnosis(patient_id, patient_data)
+            
+            # Preprocess patient data
+            processed_features = self.preprocessor.process_single_patient(patient_data)
+            
+            # Get ML predictions
+            predictions = self.model_ensemble.predict(processed_features)
+            probabilities = self.model_ensemble.predict_proba(processed_features)
+            
+            # Convert to probability dictionary
+            class_names = self.model_ensemble.class_names
+            prob_dict = {}
+            if len(probabilities.shape) > 1 and probabilities.shape[1] > 1:
+                for i, class_name in enumerate(class_names):
+                    prob_dict[class_name] = float(probabilities[0][i])
+            else:
+                # Binary classification
+                prob_dict[class_names[1]] = float(probabilities[0])
+                prob_dict[class_names[0]] = 1.0 - float(probabilities[0])
+            
+            # Apply clinical reasoning if requested
+            if include_reasoning and self.reasoning_engine:
+                reasoning_results = self.reasoning_engine.apply_clinical_reasoning(
+                    patient_data, prob_dict
+                )
+                final_predictions = reasoning_results['enhanced_predictions']
+            else:
+                final_predictions = prob_dict
+            
+            # Rank predictions by probability
+            sorted_predictions = sorted(
+                final_predictions.items(), 
+                key=lambda x: x[1], 
+                reverse=True
+            )[:5]  # Top 5 predictions
+            
+            # Structure predictions
+            structured_predictions = []
+            for condition, probability in sorted_predictions:
+                structured_predictions.append({
+                    'condition': condition,
+                    'probability': float(probability),
+                    'confidence_level': self._get_confidence_level(probability),
+                    'category': self._get_disease_category(condition)
+                })
+            
+            # Calculate confidence scores
+            confidence_scores = self._calculate_confidence_scores(final_predictions)
+            
+            # Risk assessment
+            risk_assessment = self._assess_risk(patient_data, final_predictions)
+            
+            # Generate recommendations
+            recommendations = self._generate_recommendations(
+                patient_data, structured_predictions, risk_assessment
+            )
+            
+            # Check urgent flags
+            urgent_flags = self._check_urgent_flags(patient_data, structured_predictions)
+            
+            # Create diagnosis prediction
+            diagnosis = DiagnosisPrediction(
+                patient_id=patient_id,
+                predictions=structured_predictions,
+                confidence_scores=confidence_scores,
+                risk_assessment=risk_assessment,
+                recommendations=recommendations,
+                urgent_flags=urgent_flags
+            )
+            
+            # Store in history
+            self.diagnosis_history.append(diagnosis)
+            
+            logger.info(f"Diagnosis completed for patient {patient_id}")
+            return diagnosis
+            
+        except Exception as e:
+            logger.error(f"Diagnosis failed for patient {patient_id}: {e}")
+            return self._generate_error_diagnosis(patient_id, str(e))
+    
+    def _generate_mock_diagnosis(self, patient_id: str, patient_data: Dict[str, Any]) -> DiagnosisPrediction:
+        """Generate mock diagnosis for demo purposes"""
+        # Simple rule-based mock predictions
+        mock_predictions = []
+        
+        # Get patient info for basic analysis
+        demographics = patient_data.get('demographics', {})
+        vital_signs = patient_data.get('vital_signs', {})
+        chief_complaint = patient_data.get('chief_complaint', {})
+        age = demographics.get('age', 0)
+        
+        # Simple condition detection based on symptoms/vitals
+        if vital_signs.get('systolic_bp', 0) > 140:
+            mock_predictions.append({
+                'condition': 'Hypertension',
+                'probability': 0.85,
+                'confidence_level': 'high',
+                'category': 'cardiovascular'
+            })
+        
+        if age > 45 and 'thirst' in str(chief_complaint).lower():
+            mock_predictions.append({
+                'condition': 'Type 2 Diabetes',
+                'probability': 0.72,
+                'confidence_level': 'medium',
+                'category': 'endocrine'
+            })
+        
+        if 'chest' in str(chief_complaint).lower():
+            mock_predictions.append({
+                'condition': 'Cardiovascular Disease',
+                'probability': 0.68,
+                'confidence_level': 'medium',
+                'category': 'cardiovascular'
+            })
+        
+        # Default predictions if none match
+        if not mock_predictions:
+            mock_predictions = [
+                {'condition': 'General Health Assessment Needed', 'probability': 0.60, 'confidence_level': 'medium', 'category': 'general'},
+                {'condition': 'Routine Follow-up', 'probability': 0.40, 'confidence_level': 'low', 'category': 'general'}
+            ]
+        
+        # Mock confidence scores
+        confidence_scores = {
+            'overall': mock_predictions[0]['probability'] if mock_predictions else 0.5,
+            'top_prediction': mock_predictions[0]['probability'] if mock_predictions else 0.5
+        }
+        
+        # Mock risk assessment
+        risk_score = 0.3 if age > 65 else 0.1
+        risk_assessment = {
+            'overall_risk': 'high' if risk_score > 0.6 else 'medium' if risk_score > 0.3 else 'low',
+            'risk_score': risk_score,
+            'risk_factors': ['age'] if age > 65 else [],
+            'requires_immediate_attention': risk_score > 0.7
+        }
+        
+        # Generate recommendations
+        recommendations = self._generate_recommendations(patient_data, mock_predictions, risk_assessment)
+        
+        # Check urgent flags
+        urgent_flags = self._check_urgent_flags(patient_data, mock_predictions)
+        
+        return DiagnosisPrediction(
+            patient_id=patient_id,
+            predictions=mock_predictions,
+            confidence_scores=confidence_scores,
+            risk_assessment=risk_assessment,
+            recommendations=recommendations,
+            urgent_flags=urgent_flags
+        )
+    
+    def _generate_error_diagnosis(self, patient_id: str, error_msg: str) -> DiagnosisPrediction:
+        """Generate error diagnosis"""
+        return DiagnosisPrediction(
+            patient_id=patient_id,
+            predictions=[],
+            confidence_scores={'overall': 0.0},
+            risk_assessment={'overall_risk': 'unknown', 'risk_factors': []},
+            recommendations=["Unable to generate diagnosis. Please consult a healthcare professional."],
+            urgent_flags=["diagnosis_error"]
+        )
+    
+    def _get_confidence_level(self, probability: float) -> str:
+        """Convert probability to confidence level"""
+        if probability >= 0.8:
+            return 'high'
+        elif probability >= 0.6:
+            return 'medium'
+        elif probability >= 0.4:
+            return 'low'
+        else:
+            return 'very_low'
+    
+    def _get_disease_category(self, condition: str) -> str:
+        """Get disease category for a condition"""
+        condition_lower = condition.lower()
+        categories = {
+            'cardiovascular': ['heart', 'cardio', 'hypertension', 'blood pressure'],
+            'respiratory': ['lung', 'breathing', 'asthma', 'pneumonia'],
+            'endocrine': ['diabetes', 'thyroid', 'hormone'],
+            'neurological': ['headache', 'migraine', 'stroke', 'seizure'],
+            'gastrointestinal': ['stomach', 'nausea', 'vomiting', 'diarrhea']
+        }
+        
+        for category, keywords in categories.items():
+            if any(keyword in condition_lower for keyword in keywords):
+                return category
+        return 'other'
+    
+    def _calculate_confidence_scores(self, predictions: Dict[str, float]) -> Dict[str, float]:
+        """Calculate various confidence metrics"""
+        if not predictions:
+            return {'overall': 0.0}
+        
+        probabilities = list(predictions.values())
+        top_prob = max(probabilities)
+        second_prob = sorted(probabilities, reverse=True)[1] if len(probabilities) > 1 else 0
+        
+        return {
+            'overall': float(top_prob),
+            'top_prediction': float(top_prob),
+            'certainty': float(top_prob - second_prob)
+        }
+    
+    def _assess_risk(self, patient_data: Dict[str, Any], 
+                    predictions: Dict[str, float]) -> Dict[str, Any]:
+        """Assess overall patient risk"""
+        risk_factors = []
+        risk_score = 0.0
+        
+        # Get top prediction probability
+        top_prob = max(predictions.values()) if predictions else 0
+        
+        # Age-based risk
+        demographics = patient_data.get('demographics', {})
+        age = demographics.get('age', 0)
+        if age >= 65:
+            risk_factors.append('elderly')
+            risk_score += 0.2
+        
+        # Vital signs risk
+        vital_signs = patient_data.get('vital_signs', {})
+        if vital_signs.get('systolic_bp', 0) > 160:
+            risk_factors.append('severe_hypertension')
+            risk_score += 0.3
+        
+        # High certainty predictions add to risk
+        if top_prob > 0.8:
+            risk_score += 0.2
+        
+        # Determine overall risk level
+        if risk_score >= 0.6:
+            overall_risk = 'high'
+        elif risk_score >= 0.3:
+            overall_risk = 'medium'
+        else:
+            overall_risk = 'low'
+        
+        return {
+            'overall_risk': overall_risk,
+            'risk_score': float(risk_score),
+            'risk_factors': risk_factors,
+            'requires_immediate_attention': overall_risk == 'high'
+        }
+    
+    def _generate_recommendations(self, patient_data: Dict[str, Any],
+                                predictions: List[Dict[str, Any]],
+                                risk_assessment: Dict[str, Any]) -> List[str]:
+        """Generate clinical recommendations based on diagnosis"""
+        recommendations = []
+        
+        if not predictions:
+            recommendations.append("Insufficient data for diagnosis. Please provide more information.")
+            return recommendations
+        
+        top_prediction = predictions[0]
+        condition = top_prediction['condition']
+        confidence = top_prediction['confidence_level']
+        
+        # High confidence recommendations
+        if confidence == 'high':
+            recommendations.append(f"Strong indication of {condition}. Recommend immediate specialist consultation.")
+        elif confidence == 'medium':
+            recommendations.append(f"Moderate probability of {condition}. Consider further testing and specialist referral.")
+        else:
+            recommendations.append("Inconclusive results. Recommend comprehensive examination and additional testing.")
+        
+        # Risk-based recommendations
+        if risk_assessment['overall_risk'] == 'high':
+            recommendations.append("High-risk patient. Priority scheduling and close monitoring recommended.")
+        
+        # Condition-specific recommendations
+        category = top_prediction['category']
+        if category == 'cardiovascular':
+            recommendations.append("Consider ECG, cardiac enzymes, and cardiology consultation.")
+        elif category == 'respiratory':
+            recommendations.append("Consider chest X-ray, pulmonary function tests, and respiratory evaluation.")
+        elif category == 'endocrine':
+            recommendations.append("Consider comprehensive metabolic panel and endocrinology consultation.")
+        
+        return recommendations
+    
+    def _check_urgent_flags(self, patient_data: Dict[str, Any],
+                          predictions: List[Dict[str, Any]]) -> List[str]:
+        """Check for conditions requiring urgent attention"""
+        urgent_flags = []
+        
+        # High probability of serious conditions
+        for prediction in predictions[:3]:  # Check top 3
+            if prediction['probability'] > 0.7:
+                condition = prediction['condition'].lower()
+                if any(urgent in condition for urgent in 
+                      ['infarction', 'stroke', 'embolism', 'sepsis', 'failure']):
+                    urgent_flags.append(f"possible_{prediction['condition']}")
+        
+        # Vital signs urgency
+        vital_signs = patient_data.get('vital_signs', {})
+        if vital_signs.get('systolic_bp', 0) > 180:
+            urgent_flags.append('hypertensive_crisis')
+        if vital_signs.get('heart_rate', 0) > 130:
+            urgent_flags.append('severe_tachycardia')
+        if vital_signs.get('temperature', 0) > 103:
+            urgent_flags.append('high_fever')
+        
+        # Symptom-based urgency
+        chief_complaint = patient_data.get('chief_complaint', {})
+        if chief_complaint:
+            complaint_text = str(chief_complaint.get('primary_complaint', '')).lower()
+            if any(urgent_symptom in complaint_text for urgent_symptom in 
+                  ['chest pain', 'difficulty breathing', 'severe pain', 'bleeding']):
+                urgent_flags.append('urgent_symptoms')
+        
+        return urgent_flags
+    
+    def save_models(self, filepath: str = None) -> bool:
+        """Save all trained models and preprocessors"""
+        try:
+            if self.model_ensemble:
+                return self.model_ensemble.save_models(filepath)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save models: {e}")
+            return False
+    
+    def load_models(self, filepath: str = None) -> bool:
+        """Load trained models and preprocessors"""
+        try:
+            if self.model_ensemble:
+                return self.model_ensemble.load_models(filepath)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load models: {e}")
+            return False
+    
+    def get_agent_summary(self) -> Dict[str, Any]:
+        """Get comprehensive summary of the diagnosis agent"""
+        return {
+            'diagnosis_history_count': len(self.diagnosis_history),
+            'last_diagnosis': self.diagnosis_history[-1].to_dict() if self.diagnosis_history else None,
+            'agent_status': 'ready'
+        }

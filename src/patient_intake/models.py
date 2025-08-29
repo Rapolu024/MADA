@@ -43,8 +43,8 @@ class Demographics(BaseModel):
     last_name: str = Field(..., min_length=1, max_length=100)
     date_of_birth: date
     gender: Gender
-    phone: Optional[str] = Field(None, regex=r'^\+?[\d\s\-\(\)]+$')
-    email: Optional[str] = Field(None, regex=r'^[\w\.-]+@[\w\.-]+\.\w+$')
+    phone: Optional[str] = Field(None, pattern=r'^\\+?[\\d\\s\\-\\(\\)]+$')
+    email: Optional[str] = Field(None, pattern=r'^[\\w\\.-]+@[\\w\\.-]+\\.\\w+$')
     address: Optional[str] = None
     emergency_contact: Optional[str] = None
     emergency_phone: Optional[str] = None

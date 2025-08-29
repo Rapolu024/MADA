@@ -23,7 +23,7 @@ alembic==1.11.2
 # Web Framework and Dashboard
 streamlit==1.25.0
 dash==2.12.1
-flask==2.3.2
+flask==2.2.5
 fastapi==0.101.1
 uvicorn==0.23.2
 
